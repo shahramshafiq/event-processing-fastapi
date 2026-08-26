@@ -1,0 +1,21 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Runtime data
+events.json
+files.json
+uploaded_files/
+
+# Editor/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
