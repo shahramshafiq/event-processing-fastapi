@@ -16,16 +16,12 @@ from contextlib import asynccontextmanager
 from typing import Literal
 
 
-# ---------------------------------------------------------
-# Logging
-# ---------------------------------------------------------
+# logging
 
 logging.basicConfig(level=logging.INFO)
 
 
-# ---------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------
+# configuration
 
 class Settings(BaseSettings):
 
@@ -45,17 +41,13 @@ class Settings(BaseSettings):
 settings = Settings()
 
 
-# ---------------------------------------------------------
-# Global resources
-# ---------------------------------------------------------
+# global resources
 
 valkey_client = None
 http_session = None
 
 
-# ---------------------------------------------------------
-# Lifespan
-# ---------------------------------------------------------
+# lifespan
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -81,6 +73,39 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logging.warning(f"Valkey is unavailable: {e}")
 
+    # if the app crashed or was restarted while an event was mid-processing,
+    # that event would otherwise stay stuck showing "processing" forever
+    try:
+        events_list = read_events()
+
+        recovered = False
+
+        for event in events_list:
+
+            if event["status"] == "processing":
+
+                event["status"] = "failed"
+
+                event["updated_date"] = datetime.now().isoformat()
+
+                recovered = True
+
+                logging.warning(
+                    f"Event {event['id']} was stuck in processing, "
+                    f"marking it failed after restart"
+                )
+
+                try:
+                    valkey_client.delete(f"processing:{event['id']}")
+                except Exception:
+                    pass
+
+        if recovered:
+            write_events(events_list)
+
+    except Exception as e:
+        logging.warning(f"Could not check for stuck events on startup: {e}")
+
     try:
         yield
 
@@ -97,16 +122,12 @@ async def lifespan(app: FastAPI):
             valkey_client.close()
 
 
-# ---------------------------------------------------------
-# FastAPI application
-# ---------------------------------------------------------
+# fastapi application
 
 app = FastAPI(lifespan=lifespan)
 
 
-# ---------------------------------------------------------
-# CORS
-# ---------------------------------------------------------
+# cors
 
 app.add_middleware(
     CORSMiddleware,
@@ -117,9 +138,25 @@ app.add_middleware(
 )
 
 
-# ---------------------------------------------------------
-# Models
-# ---------------------------------------------------------
+# unexpected errors
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+
+    logging.exception(
+        f"Unexpected error handling {request.method} {request.url.path}: {exc}"
+    )
+
+    return JSONResponse(
+        content={
+            "error": "INTERNAL_SERVER_ERROR",
+            "message": "An unexpected error occurred"
+        },
+        status_code=500
+    )
+
+
+# models
 
 class Event(BaseModel):
 
@@ -150,9 +187,7 @@ class FileMetadata(BaseModel):
     upload_time: str
 
 
-# ---------------------------------------------------------
-# Valkey test
-# ---------------------------------------------------------
+# valkey test
 
 @app.get("/test-valkey")
 def test_valkey():
@@ -169,9 +204,7 @@ def test_valkey():
     }
 
 
-# ---------------------------------------------------------
-# JSON file helpers
-# ---------------------------------------------------------
+# json file helpers
 
 def read_events():
 
@@ -209,9 +242,7 @@ def write_files(files_list):
         )
 
 
-# ---------------------------------------------------------
-# Processing state helper
-# ---------------------------------------------------------
+# processing state helper
 
 def set_processing_state(
     event_id,
@@ -240,9 +271,7 @@ def set_processing_state(
     )
 
 
-# ---------------------------------------------------------
-# Create event
-# ---------------------------------------------------------
+# create event
 
 @app.post("/events")
 def create_event(event: Event):
@@ -282,21 +311,17 @@ def create_event(event: Event):
     return event
 
 
-# ---------------------------------------------------------
-# Get all events
-# ---------------------------------------------------------
+# get all events
 
 @app.get("/events")
-def get_event():
+def get_events():
 
     events_list = read_events()
 
     return events_list
 
 
-# ---------------------------------------------------------
-# Get one event
-# ---------------------------------------------------------
+# get one event
 
 @app.get("/events/{event_id}")
 def get_event(event_id: int):
@@ -334,9 +359,7 @@ def get_event(event_id: int):
     )
 
 
-# ---------------------------------------------------------
-# Update event
-# ---------------------------------------------------------
+# update event
 
 @app.put("/events/{event_id}")
 def put_event(
@@ -370,9 +393,7 @@ def put_event(
     )
 
 
-# ---------------------------------------------------------
-# Delete event
-# ---------------------------------------------------------
+# delete event
 
 @app.delete("/events/{event_id}")
 def delete_event(event_id: int):
@@ -405,9 +426,7 @@ def delete_event(event_id: int):
     )
 
 
-# ---------------------------------------------------------
-# Upload PDF
-# ---------------------------------------------------------
+# upload pdf
 
 @app.post("/events/{event_id}/files")
 def upload_file(
@@ -510,9 +529,7 @@ def upload_file(
     )
 
 
-# ---------------------------------------------------------
-# Get files belonging to event
-# ---------------------------------------------------------
+# get files belonging to event
 
 @app.get("/events/{event_id}/files")
 def get_file(event_id: int):
@@ -552,9 +569,7 @@ def get_file(event_id: int):
     return event_files
 
 
-# ---------------------------------------------------------
-# Mark event as failed
-# ---------------------------------------------------------
+# mark event as failed
 
 def mark_event_failed(
     event_id,
@@ -591,9 +606,7 @@ def mark_event_failed(
     logging.error(message)
 
 
-# ---------------------------------------------------------
-# Process event
-# ---------------------------------------------------------
+# process event
 
 def process_event(event_id: int):
 
@@ -605,9 +618,7 @@ def process_event(event_id: int):
 
         event_files = []
 
-        # -------------------------------------------------
-        # Find all files belonging to event
-        # -------------------------------------------------
+        # find all files belonging to event
 
         for file in files_list:
 
@@ -615,9 +626,7 @@ def process_event(event_id: int):
 
                 event_files.append(file)
 
-        # -------------------------------------------------
-        # Find event
-        # -------------------------------------------------
+        # find event
 
         event_index = -1
 
@@ -637,9 +646,7 @@ def process_event(event_id: int):
 
             return
 
-        # -------------------------------------------------
-        # Check that event has files
-        # -------------------------------------------------
+        # check that event has files
 
         if len(event_files) == 0:
 
@@ -656,15 +663,11 @@ def process_event(event_id: int):
             f"Started processing event {event_id}"
         )
 
-        # -------------------------------------------------
-        # Total number of files
-        # -------------------------------------------------
+        # total number of files
 
         total_files = len(event_files)
 
-        # -------------------------------------------------
-        # Process every PDF
-        # -------------------------------------------------
+        # process every pdf
 
         for index, file in enumerate(event_files):
 
@@ -678,9 +681,7 @@ def process_event(event_id: int):
                 file["stored_filename"]
             )
 
-            # -------------------------------------------------
-            # 1. Read PDF
-            # -------------------------------------------------
+            # 1. read pdf
 
             try:
 
@@ -700,9 +701,7 @@ def process_event(event_id: int):
 
                 return
 
-            # -------------------------------------------------
-            # 2. Extract text
-            # -------------------------------------------------
+            # 2. extract text
 
             text = ""
 
@@ -728,9 +727,7 @@ def process_event(event_id: int):
 
                 return
 
-            # -------------------------------------------------
-            # PDF has no extractable text
-            # -------------------------------------------------
+            # pdf has no extractable text
 
             if not text.strip():
 
@@ -749,9 +746,7 @@ def process_event(event_id: int):
                 f"{file['original_filename']}"
             )
 
-            # -------------------------------------------------
-            # 3. Send extracted text to webhook
-            # -------------------------------------------------
+            # 3. send extracted text to webhook
 
             data = {
                 "event_id": event_id,
@@ -805,9 +800,7 @@ def process_event(event_id: int):
                         f"(attempt {attempt}/3): {e}"
                     )
 
-            # -------------------------------------------------
-            # All webhook attempts failed
-            # -------------------------------------------------
+            # all webhook attempts failed
 
             if not success:
 
@@ -821,9 +814,7 @@ def process_event(event_id: int):
 
                 return
 
-            # -------------------------------------------------
-            # 4. Update progress
-            # -------------------------------------------------
+            # 4. update progress
 
             # Calculate progress based on actual
             # number of files.
@@ -866,9 +857,7 @@ def process_event(event_id: int):
                 f"{progress}%"
             )
 
-        # -----------------------------------------------------
-        # 5. All files successfully processed
-        # -----------------------------------------------------
+        # 5. all files successfully processed
 
         events_list = read_events()
 
@@ -964,9 +953,7 @@ def process_event(event_id: int):
             pass
 
 
-# ---------------------------------------------------------
-# Start event processing
-# ---------------------------------------------------------
+# start event processing
 
 @app.post("/events/{event_id}/process")
 def post_process(
@@ -976,9 +963,7 @@ def post_process(
     idempotency_key: str = Header(...)
 ):
 
-    # -----------------------------------------------------
-    # Rate limiting
-    # -----------------------------------------------------
+    # rate limiting
 
     client_ip = request.client.host
 
@@ -1005,9 +990,7 @@ def post_process(
             status_code=429
         )
 
-    # -----------------------------------------------------
-    # Check event
-    # -----------------------------------------------------
+    # check event
 
     events_list = read_events()
 
@@ -1031,9 +1014,7 @@ def post_process(
             status_code=404
         )
 
-    # -----------------------------------------------------
-    # Check files
-    # -----------------------------------------------------
+    # check files
 
     files_list = read_files()
 
@@ -1055,9 +1036,7 @@ def post_process(
             status_code=404
         )
 
-    # -----------------------------------------------------
-    # Idempotency
-    # -----------------------------------------------------
+    # idempotency
 
     idempotency_valkey_key = (
         f"idempotency:{idempotency_key}"
@@ -1075,9 +1054,7 @@ def post_process(
             status_code=409
         )
 
-    # -----------------------------------------------------
-    # Processing lock
-    # -----------------------------------------------------
+    # processing lock
 
     processing_key = (
         f"processing:{event_id}"
@@ -1104,9 +1081,7 @@ def post_process(
             status_code=409
         )
 
-    # -----------------------------------------------------
-    # Save idempotency key
-    # -----------------------------------------------------
+    # save idempotency key
 
     valkey_client.set(
         idempotency_valkey_key,
@@ -1114,9 +1089,7 @@ def post_process(
         ex=300
     )
 
-    # -----------------------------------------------------
-    # Set initial processing state
-    # -----------------------------------------------------
+    # set initial processing state
 
     events_list[event_index]["status"] = "processing"
 
@@ -1138,18 +1111,14 @@ def post_process(
         f"Processing event {event_id}"
     )
 
-    # -----------------------------------------------------
-    # Start background processing
-    # -----------------------------------------------------
+    # start background processing
 
     bg_tasks.add_task(
         process_event,
         event_id
     )
 
-    # -----------------------------------------------------
-    # Return immediately
-    # -----------------------------------------------------
+    # return immediately
 
     return JSONResponse(
         content={
@@ -1159,16 +1128,12 @@ def post_process(
     )
 
 
-# ---------------------------------------------------------
-# SSE stream
-# ---------------------------------------------------------
+# sse stream
 
 @app.get("/events/{event_id}/stream")
 async def event_stream(event_id: int):
 
-    # -----------------------------------------------------
-    # Check event exists
-    # -----------------------------------------------------
+    # check event exists
 
     events_list = read_events()
 
@@ -1192,9 +1157,7 @@ async def event_stream(event_id: int):
             status_code=404
         )
 
-    # -----------------------------------------------------
-    # SSE generator
-    # -----------------------------------------------------
+    # sse generator
 
     async def event_generator():
 
@@ -1283,9 +1246,7 @@ async def event_stream(event_id: int):
                 f"SSE stream closed for event {event_id}"
             )
 
-    # -----------------------------------------------------
-    # Return SSE response
-    # -----------------------------------------------------
+    # return sse response
 
     return StreamingResponse(
         event_generator(),
@@ -1297,9 +1258,7 @@ async def event_stream(event_id: int):
     )
 
 
-# ---------------------------------------------------------
-# Health check
-# ---------------------------------------------------------
+# health check
 
 @app.get("/health")
 def health():
@@ -1309,9 +1268,7 @@ def health():
     }
 
 
-# ---------------------------------------------------------
-# Readiness check
-# ---------------------------------------------------------
+# readiness check
 
 @app.get("/health/ready")
 def health_ready():
