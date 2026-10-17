@@ -1,136 +1,161 @@
-# Event Processing System (FastAPI)
+<div align="center">
 
-A small FastAPI backend for creating events, attaching PDF files to them, and processing those files in the background: extracting the text from each PDF and sending it to a webhook. You can watch an event's progress live over SSE instead of polling for it. Valkey (a Redis-compatible store) handles caching, rate limiting, idempotency, and making sure the same event never gets processed twice at once.
+<h1>Event Processing API</h1>
 
-## What it does
+<p>A FastAPI backend that extracts text from uploaded PDFs in the background and streams the progress live.</p>
 
-- Full CRUD on events (`/events`)
-- PDF upload per event, with content-type and size checks
-- Background processing: extract text from every PDF attached to an event, POST it to a webhook, with retries if the webhook fails
-- Live progress over SSE at `/events/{event_id}/stream`
-- Valkey used for caching single-event lookups, per-IP rate limiting on the process endpoint, idempotency keys, and a processing lock so one event can't be processed by two requests at once
-- If the app crashes or gets restarted while an event is mid-processing, it gets picked back up on the next startup and marked failed instead of staying stuck showing "processing" forever
-- Any error, expected or not, comes back in the same `{"error": ..., "message": ...}` shape, no raw stack traces leaking to the client
-- Health checks at `/health` and `/health/ready`
+<p>
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white" />
+  <img alt="FastAPI 0.141" src="https://img.shields.io/badge/FastAPI-0.141-009688?style=flat-square&logo=fastapi&logoColor=white" />
+  <img alt="Pydantic 2" src="https://img.shields.io/badge/Pydantic-2.13-E92063?style=flat-square&logo=pydantic&logoColor=white" />
+  <img alt="Valkey" src="https://img.shields.io/badge/Valkey-Cache%20and%20Locks-5A4FCF?style=flat-square" />
+</p>
 
-## Tech stack
+</div>
 
-- FastAPI
-- Pydantic and pydantic-settings for config
-- Valkey (the `valkey` Python package)
-- PyPDF2 for extracting text from PDFs
-- `requests` for the outbound webhook calls
+## Overview
 
-## Project structure
+Processing documents attached to a record is slow work that should not block an API request. This service lets a client create events, attach PDF files to them, and start a background job that extracts the text from every PDF and delivers it to a configurable webhook. Progress is pushed to the client over Server-Sent Events (SSE), and Valkey handles caching, rate limiting, idempotency keys and a lock that keeps one event from being processed twice at the same time.
 
-Everything lives in one file on purpose:
+## Key Features
 
-```
+- **Event CRUD** under `/events`, with records stored in a local JSON file.
+- **PDF upload** per event with a content-type check (HTTP 415) and a configurable size limit (HTTP 413); files are saved under generated UUID names.
+- **Background processing** with FastAPI `BackgroundTasks`: the text of each PDF is extracted with PyPDF2 and POSTed to the webhook, with up to 3 attempts per file. The endpoint answers `202` immediately.
+- **Live progress over SSE** at `/events/{event_id}/stream`: the stream reads state from Valkey once a second, sends a message only when something changed, and closes when the event is `completed` or `failed`.
+- **Valkey-backed protections**: 5-minute cache for single-event lookups, per-IP rate limit on the process endpoint (5 requests per minute), `Idempotency-Key` header handling, and an `NX` processing lock with a one-hour expiry.
+- **Restart recovery**: on startup, any event left in `processing` is marked `failed` and its lock is released.
+- **Consistent error responses**: application errors return `{"error": "CODE", "message": "..."}`, and unexpected exceptions return a generic 500 without a stack trace.
+- **Health probes**: `/health` for liveness and `/health/ready`, which returns 503 when Valkey is unreachable.
+
+## Tech Stack
+
+| Area | Technology |
+|---|---|
+| Language | Python 3.10+ |
+| Web framework | FastAPI, served with Uvicorn |
+| Validation and config | Pydantic, pydantic-settings (`.env` file) |
+| Cache, locks, rate limiting | Valkey (`valkey` Python client) |
+| PDF text extraction | PyPDF2 |
+| Webhook delivery | Requests |
+| Live updates | Server-Sent Events via `StreamingResponse` |
+| Storage | Local JSON files and an `uploaded_files/` directory |
+
+## Project Structure
+
+```text
 .
-├── main.py             # the whole application
-├── requirements.txt
-├── .env.example
-└── .gitignore
+|-- main.py             # Whole application: settings, routes, background job, SSE
+|-- requirements.txt    # Pinned dependencies
+|-- .env.example        # Template for the required environment variables
+|-- .gitignore
+|-- events.json         # Created at setup, event records (git-ignored)
+|-- files.json          # Created at setup, uploaded file metadata (git-ignored)
+`-- uploaded_files/     # Created on first upload, stored PDFs (git-ignored)
 ```
 
-`events.json` and `files.json` are created automatically the first time you run it, and `uploaded_files/` gets created the first time a PDF is uploaded. None of these are tracked in git.
+## Getting Started
 
-## Getting started
+### Prerequisites
 
-### You'll need
+- Python 3.10 or newer
+- A running Valkey server (for example via Docker)
+- A URL that accepts POST requests for the extracted text (a free endpoint from webhook.site works for testing)
 
-- Python 3.10+
-- A running Valkey (or Redis) instance
+### Installation
 
-### Setup
+```bash
+git clone https://github.com/shahramshafiq/event-processing-fastapi.git
+cd event-processing-fastapi
+python -m venv .venv
+# macOS/Linux: source .venv/bin/activate
+# Windows:     .venv\Scripts\activate
+pip install -r requirements.txt python-multipart
+```
 
-1. Clone it and install dependencies:
+`python-multipart` is installed alongside the pinned requirements because FastAPI needs it to accept file uploads.
 
-   ```bash
-   git clone <repo-url>
-   cd "Event Processing System - FastAPI"
-   pip install -r requirements.txt
-   ```
+Create your environment file and the two local data files (the app reads them on every request and does not create them itself):
 
-2. Copy the example env file and fill in your own values:
+```bash
+cp .env.example .env
+python -c "open('events.json','w').write('[]'); open('files.json','w').write('[]')"
+```
 
-   ```bash
-   cp .env.example .env
-   ```
+Set the variables below in `.env`. All of them are required; `WEBHOOK_URL` in `.env.example` is a placeholder that you must replace.
 
-3. Create the local data files, only needed once:
-
-   ```bash
-   echo "[]" > events.json
-   echo "[]" > files.json
-   ```
-
-4. Start Valkey locally, for example with Docker:
-
-   ```bash
-   docker run -p 6379:6379 valkey/valkey
-   ```
-
-5. Run it:
-
-   ```bash
-   uvicorn main:app --reload
-   ```
-
-   The API is at `http://localhost:8000`, and the interactive docs are at `http://localhost:8000/docs`.
-
-## Configuration
-
-Everything's read from environment variables, see `.env.example`:
-
-| Variable | Description |
+| Variable | Purpose |
 |---|---|
 | `APP_NAME` | Application name |
-| `DEBUG` | Debug mode toggle |
-| `VALKEY_HOST` | Valkey/Redis host |
-| `VALKEY_PORT` | Valkey/Redis port |
-| `WEBHOOK_URL` | Where extracted PDF text gets POSTed after processing (use a free URL from webhook.site) |
-| `EXTERNAL_API_TIMEOUT` | Timeout in seconds for webhook requests |
-| `MAX_FILE_SIZE` | Max upload size in bytes, files bigger than this get rejected |
+| `DEBUG` | Debug flag (`true` or `false`) |
+| `VALKEY_HOST` | Valkey host |
+| `VALKEY_PORT` | Valkey port |
+| `WEBHOOK_URL` | URL that receives the extracted text |
+| `EXTERNAL_API_TIMEOUT` | Webhook request timeout in seconds |
+| `MAX_FILE_SIZE` | Maximum upload size in bytes |
 | `ALLOWED_ORIGINS` | Comma-separated list of allowed CORS origins |
 
-## API overview
+### Run
+
+Start Valkey, then the API from the project root (the JSON files and upload folder are resolved relative to it):
+
+```bash
+docker run -p 6379:6379 valkey/valkey
+uvicorn main:app --reload
+```
+
+The API is served at `http://localhost:8000` and the interactive docs at `http://localhost:8000/docs`.
+
+## Usage
 
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/events` | Create an event |
-| `GET` | `/events` | List every event |
+| `GET` | `/events` | List all events |
 | `GET` | `/events/{event_id}` | Get one event (cached in Valkey) |
-| `PUT` | `/events/{event_id}` | Update an event |
+| `PUT` | `/events/{event_id}` | Replace an event |
 | `DELETE` | `/events/{event_id}` | Delete an event |
 | `POST` | `/events/{event_id}/files` | Upload a PDF for an event |
 | `GET` | `/events/{event_id}/files` | List the files attached to an event |
-| `POST` | `/events/{event_id}/process` | Kick off background processing (needs an `Idempotency-Key` header) |
-| `GET` | `/events/{event_id}/stream` | Watch processing progress live over SSE |
-| `GET` | `/health` | Is the app running |
-| `GET` | `/health/ready` | Is Valkey reachable too |
+| `POST` | `/events/{event_id}/process` | Start background processing (requires an `Idempotency-Key` header) |
+| `GET` | `/events/{event_id}/stream` | Stream progress as SSE |
+| `GET` | `/health`, `/health/ready` | Liveness and Valkey readiness |
 
-## How PDF processing actually works
-
-1. Create an event with `POST /events`.
-2. Upload one or more PDFs to it with `POST /events/{event_id}/files`. Only PDFs are accepted, and anything over `MAX_FILE_SIZE` gets rejected.
-3. Call `POST /events/{event_id}/process` with an `Idempotency-Key` header. This is rate-limited per IP (5 requests a minute) and locked in Valkey so the same event can't start processing twice at once, calling it again while it's already running just gets you an error instead of a second job.
-4. The event's status flips to `processing`, and each uploaded PDF gets opened, has its text pulled out, and that text gets POSTed to `WEBHOOK_URL`. If the webhook call fails, it retries up to 3 times before giving up.
-5. Progress updates after every file, so with 4 PDFs you'd see it move 25%, 50%, 75%, 100%. If any single file fails to open, has no extractable text, or its webhook delivery never succeeds after retries, the whole event gets marked `failed` right there. Once every file goes through, the event is marked `completed`.
-6. You can watch this happen live with the stream endpoint below, or just poll `GET /events/{event_id}` if you'd rather not keep a connection open.
-
-## How to test the SSE stream
-
-Because it's a live stream, a normal browser tab or Postman's plain "Send" button won't show it properly, they wait for the whole response before displaying anything. Use `curl -N` instead (`-N` turns off curl's own buffering so you see each update as it arrives):
+An end-to-end run with `curl`:
 
 ```bash
+# 1. Create an event (the client chooses the integer id)
+curl -X POST http://localhost:8000/events \
+  -H "Content-Type: application/json" \
+  -d '{"id": 1, "name": "Quarterly reports", "description": "Documents for review"}'
+
+# 2. Attach a PDF
+curl -X POST http://localhost:8000/events/1/files \
+  -F "file=@report.pdf;type=application/pdf"
+
+# 3. Start processing (returns 202)
+curl -X POST http://localhost:8000/events/1/process \
+  -H "Idempotency-Key: demo-key-1"
+
+# 4. Watch progress (-N turns off curl buffering so each update shows as it arrives)
 curl -N http://localhost:8000/events/1/stream
 ```
 
-With an event that has files attached and processing already kicked off, you should see a new `data: {...}` line appear roughly once a second as progress updates, ending once the event hits `completed` or `failed`, at which point the connection just closes on its own.
+Each stream message has this shape, and with 4 PDFs the progress moves through 25, 50, 75 and 100:
 
-If you're testing in Postman instead, recent versions (10.10+) handle SSE natively, just send a normal GET request to that URL and Postman will stream the events into the response panel live instead of waiting for the connection to end.
+```text
+data: {"event_id": 1, "status": "processing", "progress": 50}
+```
 
-## License
+If a PDF cannot be opened, has no extractable text, or its webhook delivery fails after 3 attempts, the whole event is marked `failed`. Repeating the process request with the same `Idempotency-Key`, or while the event is already running, returns `409`.
 
-No license file yet, all rights reserved by the author unless stated otherwise.
+## Limitations and Roadmap
+
+- Events and file metadata live in local JSON files that are rewritten on each change, with no locking, so the service is meant for a single process. Moving to a database is the natural next step.
+- There is no authentication, and rate limiting applies only to the process endpoint.
+- Webhook retries are immediate (no backoff), and one failed file fails the whole event.
+- There are no automated tests yet.
+
+## Author
+
+**Shahram Shafiq** - [GitHub](https://github.com/shahramshafiq) | [LinkedIn](https://www.linkedin.com/in/shahramshafiq/)
